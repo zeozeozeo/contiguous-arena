@@ -48,7 +48,7 @@ To run tests, run `cargo test`. To run benchmarks, run `cargo bench` in the proj
 
 Benchmark results on an Intel Xeon E5-2690 v3 with 2133 MHz DDR4 quad-channel RAM:
 
-```
+```ignore
 append 1 element        time:   [182.92 ns 191.00 ns 199.09 ns]
 append 10 elements      time:   [166.67 ns 170.09 ns 174.47 ns]
 append 100 elements     time:   [170.19 ns 174.47 ns 179.53 ns]
