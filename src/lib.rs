@@ -17,14 +17,6 @@ impl Span {
         Span { start, end }
     }
 
-    /// Returns a new `Span` starting at `self` and ending at `other`
-    pub const fn until(&self, other: &Self) -> Self {
-        Span {
-            start: self.start,
-            end: other.end,
-        }
-    }
-
     /// Check whether `self` was defined or is a default/unknown span
     pub fn is_defined(&self) -> bool {
         *self != Self::default()
@@ -48,7 +40,7 @@ type Index = NonZeroU32;
 
 /// A strongly typed reference to an arena item.
 ///
-/// A `Handle` value can be used as an index into an [`Arena`] or [`UniqueArena`].
+/// A `Handle` value can be used as an index into an [`Arena`].
 pub struct Handle<T> {
     index: Index,
     marker: PhantomData<T>,
