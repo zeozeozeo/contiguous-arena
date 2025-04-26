@@ -49,15 +49,33 @@ To run tests, run `cargo test`. To run benchmarks, run `cargo bench` in the proj
 Benchmark results on an Intel Xeon E5-2690 v3 with 2133 MHz DDR4 quad-channel RAM:
 
 ```ignore
-append 1 element        time:   [182.92 ns 191.00 ns 199.09 ns]
-append 10 elements      time:   [166.67 ns 170.09 ns 174.47 ns]
-append 100 elements     time:   [170.19 ns 174.47 ns 179.53 ns]
-free 10 elements        time:   [248.43 ns 254.22 ns 260.94 ns]
-free 100 elements       time:   [248.16 ns 251.57 ns 255.99 ns]
+append 1 element        time:   [122.48 ns 125.71 ns 129.62 ns]
+append 10 elements      time:   [126.89 ns 129.69 ns 133.18 ns]
+append 100 elements     time:   [129.01 ns 129.65 ns 130.51 ns]
+free 10 elements        time:   [185.96 ns 189.48 ns 193.88 ns]
+free 100 elements       time:   [191.01 ns 191.40 ns 191.93 ns]
 reuse span of 10 elements
-                        time:   [245.90 ns 247.98 ns 250.80 ns]
+                        time:   [205.49 ns 210.46 ns 216.89 ns]
 reuse span of 100 elements
-                        time:   [311.23 ns 323.52 ns 336.90 ns]        
+                        time:   [266.60 ns 274.03 ns 282.45 ns]
+iterate 100 elements    time:   [85.580 ns 87.331 ns 89.547 ns]
+iterate 1000 elements   time:   [696.59 ns 715.24 ns 736.26 ns]
+iterate and mutate 100 elements
+                        time:   [67.295 ns 67.438 ns 67.636 ns]
+iterate and mutate 1000 elements
+                        time:   [625.11 ns 639.24 ns 656.52 ns]
+fetch_if found in 100 elements
+                        time:   [66.565 ns 68.174 ns 70.049 ns]
+fetch_if not found in 1000 elements
+                        time:   [582.72 ns 591.28 ns 603.65 ns]
+fetch_or_append found in 100 elements
+                        time:   [2.5913 ns 2.5918 ns 2.5922 ns]
+fetch_or_append not found in 1000 elements
+                        time:   [585.43 ns 591.74 ns 600.30 ns]
+retain_mut keep half of 100 elements
+                        time:   [325.25 ns 333.94 ns 345.95 ns]
+mixed workload with 100 elements
+                        time:   [433.85 ns 439.76 ns 452.24 ns]
 ```
 
 (light travels about 30 meters in 100 nanoseconds)

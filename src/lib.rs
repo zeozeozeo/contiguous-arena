@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, fmt, marker::PhantomData, num::NonZeroU32, ops};
 
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Span {
     start: u32,
     end: u32,
@@ -10,16 +10,14 @@ pub struct Span {
 
 impl Span {
     pub const UNDEFINED: Self = Self { start: 0, end: 0 };
-    /// Creates a new `Span` from a range of byte indices
-    ///
-    /// Note: end is exclusive, it doesn't belong to the `Span`
+
     pub const fn new(start: u32, end: u32) -> Self {
+        debug_assert!(start <= end, "Span start must be <= end");
         Span { start, end }
     }
 
-    /// Check whether `self` was defined or is a default/unknown span
     pub fn is_defined(&self) -> bool {
-        *self != Self::default()
+        self.start != self.end
     }
 
     pub fn length(&self) -> u32 {
@@ -38,9 +36,6 @@ impl std::ops::Index<Span> for str {
 
 type Index = NonZeroU32;
 
-/// A strongly typed reference to an arena item.
-///
-/// A `Handle` value can be used as an index into an [`Arena`].
 pub struct Handle<T> {
     index: Index,
     marker: PhantomData<T>,
@@ -83,10 +78,11 @@ impl<T> fmt::Debug for Handle<T> {
 impl<T> Handle<T> {
     #[cfg(test)]
     pub const DUMMY: Self = Handle {
-        index: unsafe { NonZeroU32::new_unchecked(u32::MAX) },
+        index: NonZeroU32::new(u32::MAX).unwrap(),
         marker: PhantomData,
     };
 
+    #[inline]
     pub const fn new(index: Index) -> Self {
         Handle {
             index,
@@ -94,50 +90,32 @@ impl<T> Handle<T> {
         }
     }
 
-    /// Returns the zero-based index of this handle.
+    #[inline]
     pub const fn index(self) -> usize {
         let index = self.index.get() - 1;
         index as usize
     }
 
-    /// Convert a `usize` index into a `Handle<T>`.
+    #[inline]
     fn from_usize(index: usize) -> Self {
         let handle_index = u32::try_from(index + 1)
             .ok()
             .and_then(Index::new)
-            .expect("Failed to insert into arena. Handle overflows");
+            .expect("failed to insert into arena");
         Handle::new(handle_index)
     }
 
-    /// Convert a `usize` index into a `Handle<T>`, without range checks.
+    #[inline]
     const unsafe fn from_usize_unchecked(index: usize) -> Self {
         Handle::new(Index::new_unchecked((index + 1) as u32))
     }
 }
 
-/// An arena holding a collection of reusable items of type `T`. The arena
-/// supports allocating new items *contiguously*, meaning that they will
-/// be stored next to each other
-///
-/// Adding new items to the arena produces a strongly-typed [`Handle`].
-/// The arena can be indexed using the given handle to obtain
-/// a reference to the stored item.
-///
-/// The arena *is* growable, but *not* shrinkable. Instead, elements
-/// (or spans of them) will be reused after they are freed with [`Arena::free`].
 #[derive(Clone)]
 pub struct Arena<T> {
-    /// Values of this arena, stored in a contiguous buffer. Note that when freeing elements,
-    /// there will be corpses; this buffer will not be resized as long as the arena is not cleared.
-    ///
-    /// This itself is a contiguous buffer; the arena stores metadata in 2 separate buffers.
     data: Vec<T>,
-    /// Stores alive and dead spans for elements in the area (one span can hold multiple elements).
-    ///
-    /// Dead spans (ones available for reuse) will also be stored in [`Arena::free_spans`].
-    span_info: Vec<Span>,
-    /// Stores spans that are available for reuse.
-    free_spans: Vec<Span>,
+    span_info: Vec<Span>,  // Kept sorted by span.start
+    free_spans: Vec<Span>, // Kept sorted by span.start
 }
 
 impl<T: Clone> Default for Arena<T> {
@@ -153,7 +131,6 @@ impl<T: fmt::Debug + Clone> fmt::Debug for Arena<T> {
 }
 
 impl<T: Clone> Arena<T> {
-    /// Create a new arena with no initial capacity allocated.
     pub const fn new() -> Self {
         Arena {
             data: Vec::new(),
@@ -162,163 +139,159 @@ impl<T: Clone> Arena<T> {
         }
     }
 
-    /// Create a new arena with the specified capacity allocated. Note that this does not
-    /// allocate any space for span metadata.
     pub fn with_capacity(capacity: usize) -> Self {
         Arena {
             data: Vec::with_capacity(capacity),
-            ..Default::default()
+            span_info: Vec::new(),
+            free_spans: Vec::new(),
         }
     }
 
-    /// Extracts the inner vector.
-    #[allow(clippy::missing_const_for_fn)] // ignore due to requirement of #![feature(const_precise_live_drops)]
     pub fn into_inner(self) -> Vec<T> {
         self.data
     }
 
-    /// Returns the current number of items stored in this arena.
-    /// Note that this method is slow as it has to iterate over all spans. Use [`Arena::buffer_len`]
-    /// for a faster approximation.
     pub fn len(&self) -> usize {
         self.span_info
             .iter()
-            .filter(|&&span| span.is_defined())
             .map(|span| span.length() as usize)
             .sum()
     }
 
-    /// Returns the capacity of this arena.
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
-    /// Returns the length of the internal buffer of this arena. This is enough as a rough
-    /// approximation, but note that it includes corpses.
     pub fn buffer_len(&self) -> usize {
         self.data.len()
     }
 
-    /// Returns `true` if the arena contains no elements.
     pub fn is_empty(&self) -> bool {
-        self.span_info.iter().all(|span| *span == Span::default())
+        self.span_info.is_empty()
     }
 
-    /// Returns an iterator over the items stored in this arena, returning both
-    /// the item's handle and a reference to it.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Handle<T>, &T)> {
-        self.data
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Handle<T>, &T)> + '_ {
+        self.span_info
             .iter()
-            .enumerate()
-            .map(|(i, v)| unsafe { (Handle::from_usize_unchecked(i), v) })
+            .flat_map(move |&span| (span.start..span.end))
+            .map(move |i| {
+                let handle = unsafe { Handle::from_usize_unchecked(i as usize) };
+                (handle, &self.data[i as usize])
+            })
     }
 
-    /// Drains the arena, returning an iterator over the items stored.
-    pub fn drain(&mut self) -> impl DoubleEndedIterator<Item = (Handle<T>, T, Span)> {
+    pub fn drain(&mut self) -> impl Iterator<Item = (Handle<T>, T, Span)> + '_ {
         let arena = std::mem::take(self);
         arena
             .data
             .into_iter()
-            .zip(arena.span_info)
+            .zip(
+                arena
+                    .span_info
+                    .into_iter()
+                    .flat_map(|span| std::iter::repeat_n(span, span.length() as usize)),
+            )
             .enumerate()
             .map(|(i, (v, span))| unsafe { (Handle::from_usize_unchecked(i), v, span) })
     }
 
-    /// Returns a iterator over the items stored in this arena,
-    /// returning both the item's handle and a mutable reference to it.
-    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (Handle<T>, &mut T)> {
-        self.data
-            .iter_mut()
-            .enumerate()
-            .map(|(i, v)| unsafe { (Handle::from_usize_unchecked(i), v) })
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (Handle<T>, &mut T)> + '_ {
+        let data_ptr = self.data.as_mut_ptr();
+        self.span_info
+            .iter()
+            .flat_map(move |&span| (span.start..span.end))
+            .map(move |i| {
+                let handle = unsafe { Handle::from_usize_unchecked(i as usize) };
+                let value_ref = unsafe { &mut *data_ptr.add(i as usize) };
+                (handle, value_ref)
+            })
     }
 
-    fn find_free_span(&mut self, count: usize) -> Option<Span> {
+    fn find_free_span(&mut self, count: u32) -> Option<Span> {
         if let Some(pos) = self
             .free_spans
             .iter()
-            .position(|span| (span.end - span.start) as usize >= count)
+            .position(|span| span.length() >= count)
         {
             let span = self.free_spans.remove(pos);
-            if (span.end - span.start) as usize > count {
-                // Split the span if it's larger than needed
-                let new_span = Span {
-                    start: span.start + count as u32,
+
+            if span.length() > count {
+                let remaining_span = Span {
+                    start: span.start + count,
                     end: span.end,
                 };
-                self.free_spans.push(new_span);
+                match self.free_spans.binary_search(&remaining_span) {
+                    Ok(idx) => self.free_spans.insert(idx, remaining_span),
+                    Err(idx) => self.free_spans.insert(idx, remaining_span),
+                }
             }
             Some(Span {
                 start: span.start,
-                end: span.start + count as u32,
+                end: span.start + count,
             })
         } else {
             None
         }
     }
 
-    /// Adds a new value to the arena, returning a typed handle.
     pub fn append(&mut self, value: T, count: usize) -> Handle<T> {
         assert!(count > 0);
-        if let Some(free_span) = self.find_free_span(count) {
-            let start = free_span.start as usize;
-            let end = start + count;
+        let u_count = count as u32;
+
+        if let Some(target_span) = self.find_free_span(u_count) {
+            let start = target_span.start as usize;
+            let end = target_span.end as usize;
             for i in start..end - 1 {
                 self.data[i] = value.clone();
             }
             self.data[end - 1] = value;
-            self.span_info.push(free_span);
-            return Handle::from_usize(free_span.start as usize);
-        }
 
-        let start = self.span_info.last().map_or(0, |span| span.end as usize);
-        // Copy over some data into existing arena space, if any
-        // | span | freespan | span | remaining len | cap |
-        //                            ^^^^^^^^^^^^^ we will overwrite some of this
-        if start < self.data.len() {
-            for i in start..self.data.len().min(start + count) {
-                self.data[i] = value.clone();
+            match self
+                .span_info
+                .binary_search_by_key(&target_span.start, |s| s.start)
+            {
+                Ok(_) => unreachable!("should not find existing span at reused start"),
+                Err(idx) => self.span_info.insert(idx, target_span),
             }
-        }
-        // Resize the arena if needed:
-        // | span | remaining len(20) | cap |
-        //          ^ overwritten ^^^
-        // appending 21 elements will have the last element going to the cap
-        if start + count > self.data.len() {
-            self.data.resize(start + count, value);
+
+            return Handle::from_usize(start);
         }
 
-        let span = Span::new(start as u32, (start + count) as u32);
-        self.span_info.push(span);
-        Handle::from_usize(start)
+        let start_idx = self.data.len();
+        let end_idx = start_idx + count;
+
+        self.data.resize(end_idx, value);
+
+        let new_span = Span::new(start_idx as u32, end_idx as u32);
+        self.span_info.push(new_span);
+
+        Handle::from_usize(start_idx)
     }
 
-    /// Fetch a handle to an existing type.
     pub fn fetch_if<F: Fn(&T) -> bool>(&self, fun: F) -> Option<Handle<T>> {
-        self.data
-            .iter()
-            .position(fun)
-            .map(|index| unsafe { Handle::from_usize_unchecked(index) })
+        self.iter()
+            .find(|(_, data)| fun(data))
+            .map(|(handle, _)| handle)
     }
 
-    /// Adds a value with a custom check for uniqueness:
-    /// returns a handle pointing to
-    /// an existing element if the check succeeds, or adds a new
-    /// element otherwise.
     pub fn fetch_if_or_append<F: Fn(&T, &T) -> bool>(
         &mut self,
         value: T,
         count: usize,
         fun: F,
     ) -> Handle<T> {
-        if let Some(index) = self.data.iter().position(|d| fun(d, &value)) {
-            unsafe { Handle::from_usize_unchecked(index) }
+        let found_handle = self
+            .iter()
+            .find(|(_, data)| fun(data, &value))
+            .map(|(h, _)| h);
+
+        if let Some(handle) = found_handle {
+            handle
         } else {
             self.append(value, count)
         }
     }
 
-    /// Adds a value with a check for uniqueness, where the check is plain comparison.
     pub fn fetch_or_append(&mut self, value: T, count: usize) -> Handle<T>
     where
         T: PartialEq,
@@ -327,15 +300,50 @@ impl<T: Clone> Arena<T> {
     }
 
     pub fn try_get(&self, handle: Handle<T>) -> Result<&T, &'static str> {
-        self.data.get(handle.index()).ok_or("Handle out of range")
+        let index = handle.index();
+        if index < self.data.len()
+            && self
+                .span_info
+                .binary_search_by(|probe| {
+                    if index < probe.start as usize {
+                        Ordering::Greater
+                    } else if index >= probe.end as usize {
+                        Ordering::Less
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+                .is_ok()
+        {
+            Ok(unsafe { self.data.get_unchecked(index) })
+        } else {
+            Err("Handle out of range or points to freed memory")
+        }
     }
 
-    /// Get a mutable reference to an element in the arena.
     pub fn get_mut(&mut self, handle: Handle<T>) -> &mut T {
-        self.data.get_mut(handle.index()).unwrap()
+        let index = handle.index();
+        let data_len = self.data.len();
+        let span_exists = self
+            .span_info
+            .binary_search_by(|probe| {
+                if index < probe.start as usize {
+                    Ordering::Greater
+                } else if index >= probe.end as usize {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .is_ok();
+
+        if index < data_len && span_exists {
+            unsafe { self.data.get_unchecked_mut(index) }
+        } else {
+            panic!("Handle out of range or points to freed memory");
+        }
     }
 
-    /// Clears the arena keeping all allocations
     pub fn clear(&mut self) {
         self.data.clear();
         self.span_info.clear();
@@ -343,105 +351,88 @@ impl<T: Clone> Arena<T> {
     }
 
     pub fn get_span(&self, handle: Handle<T>) -> Span {
+        let index = handle.index() as u32;
         self.span_info
-            .iter()
-            .find(|&&span| span.start == handle.index() as u32)
-            .cloned()
-            .unwrap()
+            .binary_search_by(|probe| {
+                if index < probe.start {
+                    Ordering::Greater
+                } else if index >= probe.end {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .map(|idx| self.span_info[idx])
+            .expect("Handle does not point to a valid span")
     }
 
-    /// Assert that `handle` is valid for this arena.
     pub fn check_contains_handle(&self, handle: Handle<T>) -> Result<(), &'static str> {
-        if handle.index() < self.data.len() {
-            Ok(())
-        } else {
-            Err("Handle out of range")
-        }
+        self.try_get(handle).map(|_| ())
     }
 
     pub fn retain_mut<P>(&mut self, mut predicate: P)
     where
         P: FnMut(Handle<T>, &mut T) -> bool,
     {
-        let mut retained = 0;
-        for i in 0..self.span_info.len() {
-            let span = self.span_info[i];
-            let start = span.start as usize;
-            let end = span.end as usize;
-            let mut keep = false;
+        let mut handles_to_free = Vec::new();
+        let data_ptr = self.data.as_mut_ptr();
 
-            for j in start..end {
-                let handle = Handle::from_usize(j);
-                if predicate(handle, &mut self.data[j]) {
-                    keep = true;
-                } else {
-                    self.free_spans.push(Span::new(j as u32, (j + 1) as u32));
+        for span in &self.span_info {
+            let mut keep_span = false;
+            for i in span.start..span.end {
+                let handle = unsafe { Handle::from_usize_unchecked(i as usize) };
+                let value_ref = unsafe { &mut *data_ptr.add(i as usize) };
+                if predicate(handle, value_ref) {
+                    keep_span = true;
                 }
             }
-
-            if keep {
-                if retained != i {
-                    self.span_info[retained] = self.span_info[i];
-                    for j in start..end {
-                        self.data.swap(retained * (end - start) + (j - start), j);
-                    }
-                }
-                retained += 1;
+            if !keep_span {
+                handles_to_free.push(unsafe { Handle::from_usize_unchecked(span.start as usize) });
             }
         }
 
-        self.span_info.truncate(retained);
-
-        // Sort and merge adjacent free spans
-        self.free_spans.sort_by(|a, b| a.start.cmp(&b.start));
-        let mut new_free_spans: Vec<Span> = Vec::new();
-        for span in &self.free_spans {
-            if let Some(last) = new_free_spans.last_mut() {
-                if last.end == span.start {
-                    last.end = span.end;
-                } else {
-                    new_free_spans.push(*span);
-                }
-            } else {
-                new_free_spans.push(*span);
-            }
+        for handle in handles_to_free {
+            self.free(handle);
         }
-        self.free_spans = new_free_spans;
     }
 
-    /// Marks the elements span as available for reuse. The new free span
-    /// will be merged with existing free spans if possible. The new free
-    /// spans will be sorted to make future merges easier.
     pub fn free(&mut self, handle: Handle<T>) {
-        let span = self.get_span(handle);
-        self.span_info.retain(|&s| s != span);
+        let index = handle.index() as u32;
+        let span_idx = match self.span_info.binary_search_by_key(&index, |s| s.start) {
+            Ok(idx) if self.span_info[idx].start == index => idx,
+            _ => panic!(
+                "attempted to free an invalid handle (not start of a span) or already freed span"
+            ),
+        };
 
-        // Attempt to merge with adjacent free spans
-        let mut merged = false;
-        for free_span in &mut self.free_spans {
-            if free_span.end == span.start {
-                free_span.end = span.end;
-                merged = true;
-                break;
-            } else if free_span.start == span.end {
-                free_span.start = span.start;
-                merged = true;
-                break;
-            }
+        let span_to_free = self.span_info.remove(span_idx);
+
+        let mut merged_span = span_to_free;
+
+        if let Ok(right_idx) = self
+            .free_spans
+            .binary_search_by_key(&merged_span.end, |s| s.start) {
+            merged_span.end = self.free_spans.remove(right_idx).end;
         }
 
-        if !merged {
-            self.free_spans.push(span);
+        let left_search = self
+            .free_spans
+            .binary_search_by(|probe| probe.end.cmp(&merged_span.start));
+        match left_search {
+            Ok(left_idx) => {
+                merged_span.start = self.free_spans.remove(left_idx).start;
+            }
+            Err(idx) if idx > 0 => {
+                if self.free_spans[idx - 1].end == merged_span.start {
+                    merged_span.start = self.free_spans.remove(idx - 1).start;
+                }
+            }
+            _ => {}
         }
 
-        // Sort free spans to make future merges easier
-        self.free_spans.sort_by(|a, b| a.start.cmp(&b.start));
-
-        // A free span that ends at the end of the arena is meaningless
-        if let Some(last) = self.free_spans.last() {
-            if last.end == self.data.len() as u32 {
-                self.free_spans.pop();
-            }
+        match self.free_spans.binary_search(&merged_span) {
+            Ok(_) => unreachable!("Should not have duplicate free spans"),
+            Err(idx) => self.free_spans.insert(idx, merged_span),
         }
     }
 
@@ -466,23 +457,27 @@ impl<T: Clone> Arena<T> {
     }
 }
 
-impl<T> ops::Index<Handle<T>> for Arena<T> {
+impl<T: Clone> ops::Index<Handle<T>> for Arena<T> {
     type Output = T;
+    #[inline]
     fn index(&self, handle: Handle<T>) -> &T {
-        &self.data[handle.index()]
+        match self.try_get(handle) {
+            Ok(val) => val,
+            Err(msg) => panic!("{}", msg),
+        }
     }
 }
 
-impl<T> ops::IndexMut<Handle<T>> for Arena<T> {
+impl<T: Clone> ops::IndexMut<Handle<T>> for Arena<T> {
+    #[inline]
     fn index_mut(&mut self, handle: Handle<T>) -> &mut T {
-        &mut self.data[handle.index()]
+        self.get_mut(handle)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU32;
 
     #[derive(Default)]
     struct SplitMix64 {
@@ -506,6 +501,7 @@ mod tests {
         let t2 = arena.append(0, 1);
         assert!(t1 != t2);
         assert!(arena[t1] == arena[t2]);
+        assert_eq!(arena.len(), 2);
     }
 
     #[test]
@@ -515,6 +511,7 @@ mod tests {
         let t2 = arena.append(1, 1);
         assert!(t1 != t2);
         assert!(arena[t1] != arena[t2]);
+        assert_eq!(arena.len(), 2);
     }
 
     #[test]
@@ -523,7 +520,8 @@ mod tests {
         let t1 = arena.fetch_or_append(0, 1);
         let t2 = arena.fetch_or_append(0, 1);
         assert!(t1 == t2);
-        assert!(arena[t1] == arena[t2])
+        assert!(arena[t1] == arena[t2]);
+        assert_eq!(arena.len(), 1);
     }
 
     #[test]
@@ -533,47 +531,87 @@ mod tests {
         let t2 = arena.fetch_or_append(1, 1);
         assert!(t1 != t2);
         assert!(arena[t1] != arena[t2]);
+        assert_eq!(arena.len(), 2);
+    }
+
+    #[test]
+    fn iterators_live_only() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 3); // indices 0, 1, 2
+        let _h2 = arena.append(2, 2); // indices 3, 4
+        arena.free(h1);
+        let _h3 = arena.append(3, 1); // index 5
+        let _h4 = arena.append(4, 2); // indices 0, 1 (reused)
+
+        let mut live_elements = arena.iter().map(|(_, &v)| v).collect::<Vec<_>>();
+        live_elements.sort_unstable();
+        assert_eq!(live_elements, vec![2, 2, 3, 4, 4]);
+
+        assert_eq!(arena.len(), 5);
+
+        for (_, val) in arena.iter_mut() {
+            *val *= 10;
+        }
+        let mut live_elements_mut = arena.iter().map(|(_, &v)| v).collect::<Vec<_>>();
+        live_elements_mut.sort_unstable();
+        assert_eq!(live_elements_mut, vec![20, 20, 30, 40, 40]);
     }
 
     #[test]
     fn reuse_spans() {
         let mut arena: Arena<u8> = Arena::new();
-        let t1 = arena.append(5, 10); // append 10 elements that are 5
+        let t1 = arena.append(5, 10); // Span 0..10
+        assert_eq!(arena.len(), 10);
+        assert_eq!(arena.spans(), &[Span::new(0, 10)]);
         arena.free(t1); // kill the span
-        assert!(arena.is_empty()); // arena is empty but buffer still holds 10 corpses
+        assert!(arena.is_empty());
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10)]);
 
-        let t2 = arena.append(52, 10); // again, push 10 elements, this time they are 52
-        assert_eq!(t1, t2); // should start from the same place in the buffer
+        let t2 = arena.append(52, 10); // Reuse 0..10
+        assert_eq!(t1, t2); // should start from the same place
+        assert!(arena.free_spans().is_empty());
+        assert_eq!(arena.spans(), &[Span::new(0, 10)]);
+        assert_eq!(arena.len(), 10);
 
-        // the corpses should be overwritten
         assert_eq!(arena[t2], 52);
         for i in 1..10 {
-            assert_eq!(
-                arena[Handle::new(NonZeroU32::new(t1.index() as u32 + i).unwrap())],
-                52
-            );
+            let handle = unsafe { Handle::from_usize_unchecked(t1.index() + i as usize) };
+            assert_eq!(arena[handle], 52);
         }
 
-        let t3 = arena.append(7, 42); // push 10 elements, this time they are 42
-        assert_ne!(t2, t3); // should start from a new place in the buffer
+        let t3 = arena.append(7, 42); // Append 10..52
+        assert_ne!(t2, t3); // should start from a new place
+        assert_eq!(arena.spans(), &[Span::new(0, 10), Span::new(10, 52)]);
+        assert_eq!(arena.len(), 10 + 42);
 
-        // current arena: | t2 | t3 | ... |
-        arena.free(t2);
-        // current arena: | corpse(10) | t3 | ... |
-        let t4 = arena.append(255, 20); // 20 elements, shouldn't fit in t2's hole
-        assert_ne!(t4, t3);
-        assert_eq!(arena[t4], 255);
-        // current arena: | corpse(10) | t3 | t4 | ... |
-        arena.free(t4);
-        // current arena: | corpse(10) | t3 | corpse(20) | ... |
-        let t5 = arena.append(123, 21); // fits in t4's hole and takes 1 from cap
-        assert_ne!(t5, t3);
+        arena.free(t2); // Free 0..10
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10)]);
+        assert_eq!(arena.spans(), &[Span::new(10, 52)]);
+        assert_eq!(arena.len(), 42);
+
+        let t4 = arena.append(255, 20); // Append 52..72 (doesn't fit in free span)
+        assert_ne!(t4.index(), 0); // Did not reuse 0..10
+        assert_eq!(t4.index(), 52);
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10)]);
+        assert_eq!(arena.spans(), &[Span::new(10, 52), Span::new(52, 72)]);
+        assert_eq!(arena.len(), 42 + 20);
+
+        arena.free(t4); // Free 52..72
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10), Span::new(52, 72)]);
+        assert_eq!(arena.spans(), &[Span::new(10, 52)]);
+        assert_eq!(arena.len(), 42);
+
+        let t5 = arena.append(123, 5); // Reuse part of 0..10 -> 0..5
+        assert_eq!(t5.index(), 0);
         assert_eq!(arena[t5], 123);
-        // current arena: | corpse(10) | t3 | t5 | ... |
-        arena.free(t3);
-        assert_eq!(arena.free_spans.len(), 1); // should merge span
-        assert_eq!(arena.free_spans.first(), Some(&Span { start: 0, end: 52 }));
-        // current arena: | corpse(52) | t5 | ... |
+        assert_eq!(arena.free_spans(), &[Span::new(5, 10), Span::new(52, 72)]); // Remainder 5..10 is free
+        assert_eq!(arena.spans(), &[Span::new(0, 5), Span::new(10, 52)]); // t5, t3 (sorted)
+        assert_eq!(arena.len(), 5 + 42);
+
+        arena.free(t3); // Free 10..52
+        assert_eq!(arena.free_spans(), &[Span::new(5, 72)]);
+        assert_eq!(arena.spans(), &[Span::new(0, 5)]); // Only t5 remains
+        assert_eq!(arena.len(), 5);
     }
 
     #[test]
@@ -582,62 +620,413 @@ mod tests {
 
         let mut arena: Arena<u64> = Arena::new();
         let mut rng = SplitMix64::default();
+        let mut live_handles = Vec::new();
 
-        let mut prev_handle = None;
-        let mut prev_v = None;
         for j in 0..NUM_ITERATIONS {
-            let cnt = rng.next_u64() as usize % 10 + 1;
+            let cnt = (rng.next_u64() % 10 + 1) as usize;
             let v = rng.next_u64();
             let t = arena.append(v, cnt);
+            live_handles.push((t, v, cnt));
 
-            // get values back
             assert_eq!(arena[t], v);
-            for i in 1..cnt as u32 {
-                assert_eq!(
-                    arena[Handle::new(NonZeroU32::new(t.index() as u32 + i).unwrap())],
-                    v
-                );
+            for i in 1..cnt {
+                let handle = unsafe { Handle::from_usize_unchecked(t.index() + i) };
+                assert_eq!(arena[handle], v);
             }
 
-            // check the previous value
-            if j.saturating_sub(1) % 100 != 0 {
-                if let Some(prev_handle) = prev_handle {
-                    assert_eq!(arena[prev_handle], prev_v.unwrap());
+            if j > 10 && j % 5 == 0 && !live_handles.is_empty() {
+                let idx_to_check = rng.next_u64() as usize % live_handles.len();
+                let (prev_handle, prev_v, prev_cnt) = live_handles[idx_to_check];
+                assert_eq!(arena[prev_handle], prev_v);
+                for i in 1..prev_cnt {
+                    let handle = unsafe { Handle::from_usize_unchecked(prev_handle.index() + i) };
+                    assert_eq!(arena[handle], prev_v);
                 }
             }
 
-            if j % 100 == 0 {
-                // free the span
-                arena.free(t);
-                // corpses still there
-                assert_eq!(arena[t], v);
+            if j > 5 && j % 10 == 0 && !live_handles.is_empty() {
+                let idx_to_remove = rng.next_u64() as usize % live_handles.len();
+                let (handle_to_free, _, _) = live_handles.remove(idx_to_remove);
+                arena.free(handle_to_free);
+                assert!(arena.try_get(handle_to_free).is_err());
             }
-
-            prev_handle = Some(t);
-            prev_v = Some(v);
         }
+
+        let mut total_len = 0;
+        for (handle, v, cnt) in &live_handles {
+            assert_eq!(arena[*handle], *v);
+            total_len += cnt;
+            for i in 1..*cnt {
+                let h = unsafe { Handle::from_usize_unchecked(handle.index() + i) };
+                assert_eq!(arena[h], *v);
+            }
+        }
+        assert_eq!(arena.len(), total_len);
     }
 
     #[test]
     fn arena_retain_mut() {
         let mut arena: Arena<i32> = Arena::new();
-        let t1 = arena.append(5, 10);
-        let t2 = arena.append(52, 10);
-        let _t3 = arena.append(7, 10);
-        let _t4 = arena.append(123, 21);
-        let _t5 = arena.append(-7952812, 300);
+        let h1 = arena.append(5, 10); // Span 0..10
+        let h2 = arena.append(52, 10); // Span 10..20
+        let h3 = arena.append(7, 10); // Span 20..30
+        let h4 = arena.append(123, 21); // Span 30..51
+        let h5 = arena.append(-7952812, 300); // Span 51..351
+
+        let initial_len = arena.len();
+        assert_eq!(initial_len, 10 + 10 + 10 + 21 + 300);
 
         arena.retain_mut(|h, v| {
-            if *v == 7 || h == t2 {
-                *v = 7 * 7;
+            let h_idx = h.index();
+            if h_idx >= h2.index() && h_idx < h3.index() + 10 {
+                if *v == 7 {
+                    *v = 49;
+                }
                 true
             } else {
                 false
             }
         });
 
-        assert_eq!(arena[t1], 7 * 7);
-        assert_eq!(arena[t2], 7 * 7);
+        assert!(arena.try_get(h1).is_err());
+        assert!(arena.try_get(h4).is_err());
+        assert!(arena.try_get(h5).is_err());
+
+        assert!(arena.try_get(h2).is_ok());
+        assert!(arena.try_get(h3).is_ok());
+
+        assert_eq!(arena[h2], 52);
+        for i in 0..10 {
+            let handle = unsafe { Handle::from_usize_unchecked(h2.index() + i) };
+            assert_eq!(arena[handle], 52);
+        }
+        assert_eq!(arena[h3], 49);
+        for i in 0..10 {
+            let handle = unsafe { Handle::from_usize_unchecked(h3.index() + i) };
+            assert_eq!(arena[handle], 49);
+        }
+
         assert_eq!(arena.len(), 10 + 10);
+
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10), Span::new(30, 351)]);
+    }
+
+    #[test]
+    fn get_span_test() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // 0..5
+        let h2 = arena.append(2, 10); // 5..15
+        arena.free(h1);
+        let h3 = arena.append(3, 3); // 0..3
+        let h4 = arena.append(4, 4); // 15..19
+
+        let handle_in_h3 = unsafe { Handle::from_usize_unchecked(h3.index() + 1) }; // 1 in 0..3
+        let handle_in_h2 = unsafe { Handle::from_usize_unchecked(h2.index() + 5) }; // 10 in 5..15
+        let handle_in_h4 = unsafe { Handle::from_usize_unchecked(h4.index() + 2) }; // 17 in 15..19
+
+        assert_eq!(arena.get_span(handle_in_h3), Span::new(0, 3));
+        assert_eq!(arena.get_span(handle_in_h2), Span::new(5, 15));
+        assert_eq!(arena.get_span(handle_in_h4), Span::new(15, 19));
+    }
+
+    #[test]
+    #[should_panic]
+    fn get_span_panic_freed() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5);
+        arena.free(h1);
+        arena.get_span(h1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn index_panic_freed() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5);
+        arena.free(h1);
+        let _ = arena[h1];
+    }
+
+    #[test]
+    #[should_panic]
+    fn index_mut_panic_freed() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5);
+        arena.free(h1);
+        arena[h1] = 9;
+    }
+
+    #[test]
+    #[should_panic]
+    fn free_panic_middle_of_span() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // Span 0..5
+        let handle_in_middle = unsafe { Handle::from_usize_unchecked(h1.index() + 2) }; // Index 2
+        arena.free(handle_in_middle);
+    }
+
+    #[test]
+    fn append_after_free_all() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // Span 0..5
+        let h2 = arena.append(2, 5); // Span 5..10
+        arena.free(h1);
+        arena.free(h2);
+        assert!(arena.is_empty());
+        assert_eq!(arena.free_spans(), &[Span::new(0, 10)]);
+
+        let h3 = arena.append(3, 10); // Should reuse 0..10
+        assert_eq!(h3.index(), 0);
+        assert_eq!(arena[h3], 3);
+        for i in 0..10 {
+            let handle = unsafe { Handle::from_usize_unchecked(i) };
+            assert_eq!(arena[handle], 3);
+        }
+        assert_eq!(arena.spans(), &[Span::new(0, 10)]);
+        assert!(arena.free_spans().is_empty());
+    }
+
+    #[test]
+    fn merge_free_spans() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // 0..5
+        let h2 = arena.append(2, 5); // 5..10
+        let h3 = arena.append(3, 5); // 10..15
+        arena.free(h1); // Free 0..5
+        arena.free(h3); // Free 10..15
+        assert_eq!(arena.free_spans(), &[Span::new(0, 5), Span::new(10, 15)]);
+
+        arena.free(h2); // Free 5..10, should merge with 0..5 and 10..15
+        assert_eq!(arena.free_spans(), &[Span::new(0, 15)]);
+        assert!(arena.spans().is_empty());
+    }
+
+    #[test]
+    fn append_exact_fit() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 10); // 0..10
+        arena.free(h1); // Free 0..10
+        let h2 = arena.append(2, 10); // Should reuse 0..10 exactly
+        assert_eq!(h2.index(), 0);
+        assert_eq!(arena[h2], 2);
+        assert_eq!(arena.spans(), &[Span::new(0, 10)]);
+        assert!(arena.free_spans().is_empty());
+    }
+
+    #[test]
+    fn append_larger_than_free() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // 0..5
+        arena.free(h1); // Free 0..5
+        let h2 = arena.append(2, 10); // Needs 10, only 5 free, so append at 5..15
+        assert_eq!(h2.index(), 5);
+        assert_eq!(arena[h2], 2);
+        assert_eq!(arena.spans(), &[Span::new(5, 15)]);
+        assert_eq!(arena.free_spans(), &[Span::new(0, 5)]);
+    }
+
+    #[test]
+    fn multiple_handles_same_span() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5); // 0..5
+        for i in 0..5 {
+            let handle = unsafe { Handle::from_usize_unchecked(h1.index() + i) };
+            assert_eq!(arena.get_span(handle), Span::new(0, 5));
+        }
+    }
+
+    #[test]
+    fn iterate_arena() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 3); // 0..3
+        let h2 = arena.append(2, 2); // 3..5
+        let mut iter = arena.iter();
+        assert_eq!(iter.next(), Some((h1, &1)));
+        assert_eq!(
+            iter.next(),
+            Some((unsafe { Handle::from_usize_unchecked(1) }, &1))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((unsafe { Handle::from_usize_unchecked(2) }, &1))
+        );
+        assert_eq!(iter.next(), Some((h2, &2)));
+        assert_eq!(
+            iter.next(),
+            Some((unsafe { Handle::from_usize_unchecked(4) }, &2))
+        );
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn drain_arena() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 3); // 0..3
+        let h2 = arena.append(2, 2); // 3..5
+        let drained: Vec<_> = arena.drain().collect();
+        assert_eq!(drained.len(), 5);
+        assert_eq!(drained[0], (h1, 1, Span::new(0, 3)));
+        assert_eq!(
+            drained[1],
+            (
+                unsafe { Handle::from_usize_unchecked(1) },
+                1,
+                Span::new(0, 3)
+            )
+        );
+        assert_eq!(
+            drained[2],
+            (
+                unsafe { Handle::from_usize_unchecked(2) },
+                1,
+                Span::new(0, 3)
+            )
+        );
+        assert_eq!(drained[3], (h2, 2, Span::new(3, 5)));
+        assert_eq!(
+            drained[4],
+            (
+                unsafe { Handle::from_usize_unchecked(4) },
+                2,
+                Span::new(3, 5)
+            )
+        );
+        assert!(arena.is_empty());
+        assert!(arena.spans().is_empty());
+        assert!(arena.free_spans().is_empty());
+    }
+
+    #[test]
+    fn test_with_struct() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct TestStruct {
+            a: u32,
+            b: u32,
+        }
+
+        let mut arena: Arena<TestStruct> = Arena::new();
+        let val1 = TestStruct { a: 1, b: 2 };
+        let val2 = TestStruct { a: 3, b: 4 };
+        let h1 = arena.append(val1.clone(), 5);
+        let h2 = arena.append(val2.clone(), 5);
+        assert_eq!(arena[h1], val1);
+        assert_eq!(arena[h2], val2);
+        arena.free(h1);
+        let h3 = arena.append(val2.clone(), 5);
+        assert_eq!(h3.index(), 0);
+        assert_eq!(arena[h3], val2);
+    }
+
+    #[test]
+    fn test_zero_sized() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct ZeroSized;
+
+        let mut arena: Arena<ZeroSized> = Arena::new();
+        let h1 = arena.append(ZeroSized, 10);
+        assert_eq!(arena.len(), 10);
+        for i in 0..10 {
+            let handle = unsafe { Handle::from_usize_unchecked(h1.index() + i) };
+            assert_eq!(arena[handle], ZeroSized);
+        }
+        arena.free(h1);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_if() {
+        let mut arena: Arena<u8> = Arena::new();
+        let _h1 = arena.append(1, 5);
+        let h2 = arena.append(2, 5);
+        let found = arena.fetch_if(|&v| v == 2);
+        assert_eq!(found, Some(h2));
+        let not_found = arena.fetch_if(|&v| v == 3);
+        assert_eq!(not_found, None);
+    }
+
+    #[test]
+    fn test_fetch_if_or_append_custom() {
+        #[derive(Clone, Debug)]
+        struct Person {
+            name: String,
+            age: u32,
+        }
+
+        let mut arena: Arena<Person> = Arena::new();
+        let alice1 = Person {
+            name: "Alice".to_string(),
+            age: 30,
+        };
+        let alice2 = Person {
+            name: "Alice".to_string(),
+            age: 31,
+        };
+        let bob = Person {
+            name: "Bob".to_string(),
+            age: 25,
+        };
+
+        let h1 = arena.fetch_if_or_append(alice1.clone(), 1, |p1, p2| p1.name == p2.name);
+        let h2 = arena.fetch_if_or_append(alice2.clone(), 1, |p1, p2| p1.name == p2.name);
+        assert_eq!(h1, h2); // Same name, should reuse h1
+        assert_eq!(arena[h1].age, 30);
+
+        let h3 = arena.fetch_if_or_append(bob.clone(), 1, |p1, p2| p1.name == p2.name);
+        assert_ne!(h1, h3);
+        assert_eq!(arena[h3].name, "Bob");
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 5);
+        let h2 = arena.append(2, 5);
+        assert_eq!(arena.len(), 10);
+        arena.clear();
+        assert!(arena.is_empty());
+        assert!(arena.spans().is_empty());
+        assert!(arena.free_spans().is_empty());
+        assert!(arena.try_get(h1).is_err());
+        assert!(arena.try_get(h2).is_err());
+    }
+
+    #[test]
+    fn free_and_reuse_partially() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 10); // 0..10
+        arena.free(h1); // Free 0..10
+        let h2 = arena.append(2, 3); // Reuse 0..3
+        let h3 = arena.append(3, 4); // Reuse 3..7
+        assert_eq!(h2.index(), 0);
+        assert_eq!(h3.index(), 3);
+        assert_eq!(arena.spans(), &[Span::new(0, 3), Span::new(3, 7)]);
+        assert_eq!(arena.free_spans(), &[Span::new(7, 10)]);
+        assert_eq!(arena[h2], 2);
+        assert_eq!(arena[h3], 3);
+    }
+
+    #[test]
+    fn handle_ordering() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 1);
+        let h2 = arena.append(2, 1);
+        assert!(h1 < h2);
+        arena.free(h1);
+        let h3 = arena.append(3, 1); // Should reuse h1's spot
+        assert_eq!(h3, h1);
+        assert!(h3 < h2);
+    }
+
+    #[test]
+    fn large_counts() {
+        let mut arena: Arena<u8> = Arena::new();
+        let h1 = arena.append(1, 1000);
+        assert_eq!(arena.len(), 1000);
+        for i in 0..1000 {
+            let handle = unsafe { Handle::from_usize_unchecked(h1.index() + i) };
+            assert_eq!(arena[handle], 1);
+        }
+        arena.free(h1);
+        assert!(arena.is_empty());
     }
 }
